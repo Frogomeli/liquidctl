@@ -3,7 +3,7 @@ from collections import deque
 
 from liquidctl import ExpectationNotMet
 from liquidctl.driver.commander_core import CommanderCore, _parse_speeds, _parse_temps
-from _testutils import noop
+from _testutils import noop, MockRuntimeStorage
 from liquidctl.util import u16le_from
 
 
@@ -39,12 +39,20 @@ class MockCommanderCoreDevice:
         # whole payload on every read.
         self.chunked_reads = False
         self._read_offset = 0
+
+        self._color_endpoint = False
+        self.color_length = 0
+        self.color_type = None
+        self.color_data = bytearray()
         # Reports that are delivered ahead of the real command response.
         self.stale_reads = deque()
 
         self.response_prefix = ()
         self.firmware_version = (0x00, 0x00, 0x00)
         self.led_counts = (None, None, None, None, None, None, None)
+        # Per-channel LED status byte; None keeps the legacy connected/disconnected
+        # convention (2 when a count is set, 3 otherwise).
+        self.led_statuses = (None, None, None, None, None, None, None)
         self.speeds_mode = (0, 0, 0, 0, 0, 0, 0)
         self.speeds = (None, None, None, None, None, None, None)
         self.fixed_speeds = (0, 0, 0, 0, 0, 0, 0)
@@ -82,12 +90,12 @@ class MockCommanderCoreDevice:
                     elif mode[0] == 0x20:  # LED detect
                         data.extend([0x0f, 0x00])
                         data.append(len(self.led_counts))
-                        for i in self.led_counts:
-                            if i is None:
-                                data.extend(int_to_le(3)+int_to_le(0))
-                            else:
-                                data.extend(int_to_le(2))
-                                data.extend(int_to_le(i))
+                        for i, count in enumerate(self.led_counts):
+                            status = self.led_statuses[i]
+                            if status is None:
+                                status = 2 if count is not None else 3
+                            data.extend(int_to_le(status))
+                            data.extend(int_to_le(count or 0))
                     elif mode[0] == 0x21:  # Get temperatures
                         data.extend([0x10, 0x00])
                         data.append(len(self.temperatures))
@@ -158,6 +166,23 @@ class MockCommanderCoreDevice:
         self.sent.append(data)
         if data[0] != 0x00 or data[1] != 0x08:
             raise ValueError('Start of packets going out should be 00:08')
+        if data[2] == 0x0d and data[3] == 0x00 and data[4] == 0x22:
+            self._color_endpoint = True
+            return len(data)
+        if data[2] == 0x05 and data[3] == 0x01 and data[4] == 0x01:
+            self._color_endpoint = False
+            return len(data)
+        if self._color_endpoint and data[2] in (0x06, 0x07):
+            if data[2] == 0x06:
+                self.color_length = u16le_from(data[4:6])
+                self.color_type = data[8:10]
+                self.color_data = bytearray(data[10:8 + self.color_length])
+            else:
+                self.color_data.extend(data[4:])
+            expected = self.color_length - 2
+            if len(self.color_data) > expected:
+                self.color_data = self.color_data[:expected]
+            return len(data)
         if data[2] == 0x0d:
             channel = data[3]
             self._read_offset = 0
@@ -219,7 +244,7 @@ class MockCommanderCoreDevice:
 def commander_core_device():
     device = MockCommanderCoreDevice()
     core = CommanderCore(device, 'Corsair Commander Core', True)
-    core.connect()
+    core.connect(runtime_storage=MockRuntimeStorage(key_prefixes=['testing']))
     return core
 
 
@@ -230,7 +255,7 @@ def commander_st_device():
     device.response_length = 64
     device.chunked_reads = True
     core = CommanderCore(device, 'Corsair Commander ST', True)
-    core.connect()
+    core.connect(runtime_storage=MockRuntimeStorage(key_prefixes=['testing']))
     return core
 
 
@@ -265,6 +290,81 @@ def test_initialize_commander_st_64_byte_reports(commander_st_device):
     assert res[16][1] is False
 
     assert not device._awake
+
+
+def test_initialize_commander_st_pump_led_count(commander_st_device):
+    """The ST reports the pump status as 0x0302, with 24 LEDs."""
+    device = commander_st_device.device
+    device.firmware_version = (0x02, 0x00, 0x13)
+    device.led_counts = (24, 8, 8, None, None, None, None)
+    device.led_statuses = (0x0302, None, None, None, None, None, None)
+    device.speeds = (2500, 1000, 1000, None, None, None, None)
+    device.temperatures = (30.0, None)
+
+    res = commander_st_device.initialize()
+
+    assert res[1] == ('AIO LED count', 24, '')
+    assert res[2] == ('RGB port 1 LED count', 8, '')
+
+
+def test_set_color_commander_st_pump_fixed(commander_st_device):
+    """A fixed pump color is expanded to all 24 pump LEDs."""
+    device = commander_st_device.device
+    device.led_counts = (24, 8, 8, None, None, None, None)
+
+    commander_st_device.set_color('pump', 'fixed', [(255, 0, 0)])
+
+    assert list(device.color_type) == [0x12, 0x00]
+    assert len(device.color_data) == (24 + 8 + 8) * 3
+    assert device.color_data[0:3] == b'\xff\x00\x00'
+    assert device.color_data[24 * 3:24 * 3 + 3] == b'\x00\x00\x00'
+    assert device.color_data[-3:] == b'\x00\x00\x00'
+
+
+def test_set_color_preserves_cached_channels(commander_st_device):
+    """Configuring one channel must not clear the others configured earlier."""
+    device = commander_st_device.device
+    device.led_counts = (24, 8, 8, None, None, None, None)
+
+    commander_st_device.set_color('pump', 'fixed', [(255, 0, 0)])
+    commander_st_device.set_color('fan1', 'fixed', [(0, 255, 0)])
+
+    assert len(device.color_data) == (24 + 8 + 8) * 3
+    assert device.color_data[0:3] == b'\xff\x00\x00'
+    assert device.color_data[24 * 3:24 * 3 + 3] == b'\x00\xff\x00'
+    assert device.color_data[32 * 3:32 * 3 + 3] == b'\x00\x00\x00'
+
+
+def test_set_color_off_commander_st_pump(commander_st_device):
+    device = commander_st_device.device
+    device.led_counts = (24, 8, None, None, None, None, None)
+
+    commander_st_device.set_color('pump', 'fixed', [(10, 20, 30)])
+    commander_st_device.set_color('pump', 'off', [])
+
+    assert len(device.color_data) == (24 + 8) * 3
+    assert device.color_data[0:3] == b'\x00\x00\x00'
+
+
+def test_set_color_super_fixed_commander_st(commander_st_device):
+    device = commander_st_device.device
+    device.led_counts = (4, None, None, None, None, None, None)
+
+    commander_st_device.set_color('pump', 'super-fixed', [(1, 2, 3), (4, 5, 6)])
+
+    assert device.color_data == bytes([1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0])
+
+
+def test_set_color_rejects_bad_channel(commander_st_device):
+    with pytest.raises(ValueError, match='unknown channel'):
+        commander_st_device.set_color('led1', 'fixed', [(1, 2, 3)])
+
+
+def test_set_color_rejects_bad_mode(commander_st_device):
+    device = commander_st_device.device
+    device.led_counts = (4, None, None, None, None, None, None)
+    with pytest.raises(ValueError, match='unknown mode'):
+        commander_st_device.set_color('pump', 'rainbow', [])
 
 
 def test_status_commander_st_64_byte_reports(commander_st_device):

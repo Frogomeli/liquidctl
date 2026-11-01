@@ -9,11 +9,13 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import logging
+import re
 import time
 from contextlib import contextmanager
 
 from liquidctl.driver.usb import UsbHidDriver
-from liquidctl.error import ExpectationNotMet, NotSupportedByDriver, NotSupportedByDevice
+from liquidctl.error import ExpectationNotMet, NotSupportedByDevice
+from liquidctl.keyval import RuntimeStorage
 from liquidctl.util import clamp, u16le_from
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,6 +56,12 @@ _CMD_READ_MORE = (0x08, 0x00, 0x02)
 _CMD_READ_FINAL = (0x08, 0x00, 0x03)
 _CMD_WRITE = (0x06, 0x00)
 _CMD_WRITE_MORE = (0x07, 0x00)
+
+# The color endpoint uses a different close command than the data endpoints.
+_CMD_CLOSE_COLOR_ENDPOINT = (0x05, 0x01, 0x01)
+_MODE_SET_COLOR = (0x22,)
+_DATA_TYPE_SET_COLOR = (0x12, 0x00)
+_COLOR_CHUNK_SIZE = 61
 
 _MODE_LED_COUNT = (0x20,)
 _MODE_GET_SPEEDS = (0x17,)
@@ -124,6 +132,19 @@ class CommanderCore(UsbHidDriver):
     def __init__(self, device, description, has_pump, **kwargs):
         super().__init__(device, description, **kwargs)
         self._has_pump = has_pump
+        # initialized in connect()
+        self._data = None
+
+    def connect(self, runtime_storage=None, **kwargs):
+        """Connect to the device."""
+        ret = super().connect(**kwargs)
+        if runtime_storage:
+            self._data = runtime_storage
+        else:
+            ids = f'vid{self.vendor_id:04x}_pid{self.product_id:04x}'
+            loc = 'loc' + '_'.join(re.findall(r'\d+', self.address))
+            self._data = RuntimeStorage(key_prefixes=[ids, loc])
+        return ret
 
     def initialize(self, **kwargs):
         """Initialize the device and get the fan modes."""
@@ -137,16 +158,11 @@ class CommanderCore(UsbHidDriver):
 
             status = [('Firmware version', '{}.{}.{}'.format(*fw_version), '')]
 
-            # Get LEDs per fan.  The payload can be shorter than the advertised
-            # count on a desynchronized or truncated response (the Commander ST
-            # uses 64-byte HID reports, so its capacity per transaction differs
-            # from the Core/Core XT); only consume complete records.
-            res = self._read_data(_MODE_LED_COUNT, _DATA_TYPE_LED_COUNT)
-            num_devices = min(res[0], _MAX_CHANNELS, (len(res) - 1) // 4) if res else 0
-            led_data = res[1:1 + num_devices * 4]
-            for i in range(0, num_devices):
-                connected = u16le_from(led_data, offset=i * 4) == 2
-                num_leds = u16le_from(led_data, offset=i * 4 + 2)
+            # Get LEDs per fan.  The first byte of each record is the connection
+            # status (2 = connected); the second byte can carry a device type
+            # (the ST reports 0x03 for the pump), so it must not be folded into
+            # the status.
+            for i, (connected, num_leds) in enumerate(self._get_led_channels()):
                 if self._has_pump:
                     label = 'AIO LED count' if i == 0 else f'RGB port {i} LED count'
                 else:
@@ -204,7 +220,117 @@ class CommanderCore(UsbHidDriver):
         return status
 
     def set_color(self, channel, mode, colors, **kwargs):
-        raise NotSupportedByDriver
+        """Set static colors for the pump ring or a fan LED channel.
+
+        | Channel | Mode        | Colors |
+        | ------- | ----------- | ------ |
+        | pump    | off         |      0 |
+        | pump    | fixed       |      1 |
+        | pump    | super-fixed |   0..N |
+        | fan1-6  | off         |      0 |
+        | fan1-6  | fixed       |      1 |
+        | fan1-6  | super-fixed |   0..N |
+
+        `fixed` applies one color to every LED in the channel.  `super-fixed`
+        applies one color per LED; LEDs without a color are turned off.
+
+        The device expects a frame containing every LED of every channel, so
+        liquidctl remembers the colors it has written per channel (in its
+        runtime storage) and merges them into each update.  Channels that have
+        not been configured by liquidctl in this session are written as black.
+        """
+        colors = list(colors)
+        self._check_color_args(channel, mode, colors)
+        index = self._parse_led_channel(channel)
+
+        with self._wake_device_context():
+            led_channels = self._get_led_channels()
+            if index >= len(led_channels):
+                raise NotSupportedByDevice(f'channel {channel} has no LEDs')
+            connected, count = led_channels[index]
+            if not connected or count == 0:
+                raise NotSupportedByDevice(f'channel {channel} is not connected')
+
+            if mode == 'off':
+                channel_colors = [(0, 0, 0)] * count
+            elif mode == 'fixed':
+                channel_colors = [colors[0]] * count
+            else:  # super-fixed
+                channel_colors = colors[:count]
+                channel_colors += [(0, 0, 0)] * (count - len(channel_colors))
+
+            cached = self._data.load('led_colors', of_type=dict, default={})
+            name = self._led_channel_name(index)
+            cached[name] = [list(color) for color in channel_colors]
+
+            payload = bytearray()
+            for i, (is_connected, num_leds) in enumerate(led_channels):
+                if not is_connected or num_leds == 0:
+                    continue
+                values = cached.get(self._led_channel_name(i), [])
+                for led in range(num_leds):
+                    rgb = values[led] if led < len(values) else (0, 0, 0)
+                    payload.extend(rgb)
+
+            self._write_color_frame(bytes(payload))
+            self._data.store('led_colors', cached)
+
+    def _check_color_args(self, channel, mode, colors):
+        if mode not in ('off', 'fixed', 'super-fixed'):
+            raise ValueError(
+                f"unknown mode: {mode!r}, should be one of: 'off', 'fixed', 'super-fixed'"
+            )
+        if mode == 'off':
+            if colors:
+                raise ValueError('off mode does not take colors')
+        elif mode == 'fixed':
+            if len(colors) != 1:
+                raise ValueError('fixed mode requires exactly one color')
+        elif not colors:
+            raise ValueError('super-fixed mode requires at least one color')
+
+        for color in colors:
+            if len(color) != 3 or not all(0 <= component <= 255 for component in color):
+                raise ValueError(f'invalid color: {color!r}')
+        self._parse_led_channel(channel)
+
+    def _parse_led_channel(self, channel):
+        if self._has_pump and channel == 'pump':
+            return 0
+        if channel.startswith('fan') and channel[3:].isdigit():
+            fan = int(channel[3:])
+            if 1 <= fan <= _FAN_COUNT:
+                return self._fan_to_channel(fan)
+
+        names = (['pump'] if self._has_pump else []) + [
+            f'fan{i}' for i in range(1, _FAN_COUNT + 1)
+        ]
+        raise ValueError(
+            'unknown channel, should be one of: ' + ', '.join(f'"{name}"' for name in names)
+        )
+
+    def _led_channel_name(self, index):
+        if self._has_pump:
+            return 'pump' if index == 0 else f'fan{index}'
+        return f'fan{index + 1}'
+
+    def _write_color_frame(self, colors):
+        frame = bytearray(2 + 2 + len(_DATA_TYPE_SET_COLOR) + len(colors))
+        frame[0:2] = int.to_bytes(
+            len(colors) + len(_DATA_TYPE_SET_COLOR), length=2, byteorder='little'
+        )
+        frame[4:4 + len(_DATA_TYPE_SET_COLOR)] = _DATA_TYPE_SET_COLOR
+        frame[4 + len(_DATA_TYPE_SET_COLOR):] = colors
+
+        self._send_command(_CMD_CLOSE_COLOR_ENDPOINT)
+        self._send_command(_CMD_OPEN_ENDPOINT, _MODE_SET_COLOR)
+        try:
+            for offset in range(0, len(frame), _COLOR_CHUNK_SIZE):
+                chunk = frame[offset:offset + _COLOR_CHUNK_SIZE]
+                command = _CMD_WRITE if offset == 0 else _CMD_WRITE_MORE
+                self._send_command(command, chunk)
+        finally:
+            self._send_command(_CMD_CLOSE_COLOR_ENDPOINT)
 
     def set_speed_profile(self, channel, profile, **kwargs):
         channels = self._parse_channels(channel)
@@ -302,6 +428,20 @@ class CommanderCore(UsbHidDriver):
 
     def _get_temps(self):
         return _parse_temps(self._read_data(_MODE_GET_TEMPS, _DATA_TYPE_TEMPS))
+
+    def _get_led_channels(self):
+        """Return [(connected, led_count), ...] for every LED channel."""
+        res = self._read_data(_MODE_LED_COUNT, _DATA_TYPE_LED_COUNT)
+        if not res:
+            return []
+        num_devices = min(res[0], _MAX_CHANNELS, (len(res) - 1) // 4)
+        channels = []
+        for i in range(num_devices):
+            offset = 1 + i * 4
+            connected = res[offset] == 2
+            num_leds = u16le_from(res, offset=offset + 2)
+            channels.append((connected, num_leds))
+        return channels
 
     def _report_length(self):
         """HID report size advertised by this device."""

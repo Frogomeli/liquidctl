@@ -64,6 +64,37 @@ Corsair Commander Core XT
 ```
 
 
+## Lighting
+
+_New in 1.17.0._<br>
+
+The pump/AIO ring and the fan LED channels can be set to static colors.
+
+```
+# pump ring
+liquidctl set pump color fixed ff0000
+
+# fan port 1
+liquidctl set fan1 color fixed 00ff00
+
+# turn the pump ring off
+liquidctl set pump color off
+```
+
+The valid channels are `pump` and `fan1` to `fan6`.  Static colors support the
+`off`, `fixed` and `super-fixed` modes:
+
+- `off` turns the channel off.
+- `fixed` applies one color to every LED in the channel.
+- `super-fixed` applies one color per LED; missing colors turn those LEDs off.
+
+The device expects a single frame containing every LED of every channel, so
+liquidctl remembers the colors it has written per channel in its runtime
+storage and merges them into later updates.  Channels that liquidctl has not
+configured yet are written as black, which means the first lighting command
+after a reboot also turns the other channels off.  Animated effects are not
+supported: liquidctl is not a daemon, so it cannot stream frames continuously.
+
 ## Programming the pump and fan speeds
 
 ### Speed curve profiles
