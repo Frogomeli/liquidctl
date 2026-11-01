@@ -9,6 +9,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import logging
+import time
 from contextlib import contextmanager
 
 from liquidctl.driver.usb import UsbHidDriver
@@ -29,6 +30,13 @@ _MAX_CHANNELS = _FAN_COUNT + 1
 # between clear_enqueued_reports() and read().  Keep the wait for the actual
 # response bounded so a desynchronized device fails cleanly instead of hanging.
 _MAX_RESPONSE_RETRIES = 8
+
+# A second process (for example a fan/telemetry daemon) can talk to the same
+# hidraw node.  Its replies are indistinguishable from ours when both use the
+# same command byte, so the only reliable recovery is to retry the whole
+# endpoint transaction until the data type matches.
+_READ_ATTEMPTS = 4
+_READ_RETRY_DELAY = 0.2
 
 _CMD_WAKE = (0x01, 0x03, 0x00, 0x02)
 _CMD_SLEEP = (0x01, 0x03, 0x00, 0x01)
@@ -59,6 +67,13 @@ _DATA_TYPE_HW_CURVE_PERCENT = (0x05, 0x00)
 
 _FAN_MODE_FIXED_PERCENT = 0x00
 _FAN_MODE_CURVE_PERCENT = 0x02
+
+
+class _DeviceBusy(ExpectationNotMet):
+    """The device did not answer us, most likely because another client did."""
+
+    def __str__(self):
+        return self.args[0] if self.args else 'device is answering another client'
 
 
 def _parse_speeds(data):
@@ -277,17 +292,29 @@ class CommanderCore(UsbHidDriver):
         return _parse_temps(self._read_data(_MODE_GET_TEMPS, _DATA_TYPE_TEMPS))
 
     def _read_data(self, mode, data_type):
-        self._send_command(_CMD_OPEN_ENDPOINT, mode)
-        raw_data = self._send_command(_CMD_READ_INITIAL)
-        more_raw_data = self._send_command(_CMD_READ_MORE)
-        final_raw_data = self._send_command(_CMD_READ_FINAL)
-        self._send_command(_CMD_CLOSE_ENDPOINT)
-        if len(raw_data) < 5:
-            raise ExpectationNotMet('device returned truncated data header')
-        if tuple(raw_data[3:5]) != data_type:
-            raise ExpectationNotMet('device returned incorrect data type')
+        error = 'device returned no data'
+        for attempt in range(_READ_ATTEMPTS):
+            if attempt:
+                time.sleep(_READ_RETRY_DELAY)
 
-        return raw_data[5:] + more_raw_data[3:] + final_raw_data[3:]
+            self._send_command(_CMD_OPEN_ENDPOINT, mode)
+            raw_data = self._send_command(_CMD_READ_INITIAL)
+            more_raw_data = self._send_command(_CMD_READ_MORE)
+            final_raw_data = self._send_command(_CMD_READ_FINAL)
+            self._send_command(_CMD_CLOSE_ENDPOINT)
+
+            if len(raw_data) < 5:
+                error = 'device returned truncated data header'
+                continue
+            if tuple(raw_data[3:5]) != data_type:
+                error = 'device returned incorrect data type'
+                continue
+
+            return raw_data[5:] + more_raw_data[3:] + final_raw_data[3:]
+
+        raise _DeviceBusy(
+            f'{error}; retried {_READ_ATTEMPTS} times (another program may be using the device)'
+        )
 
     def _send_command(self, command, data=()):
         # self.device.write expects buf[0] to be the report number or 0 if not used

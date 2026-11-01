@@ -48,6 +48,13 @@ Device -> Host: 96 bytes for firmware v2.x.x | 1024 bytes for firmware v1.x.x
 > assume a 96-byte transfer when parsing the ST, and never trust an advertised
 > record count beyond the bytes that were actually received.
 
+> **Note on concurrent clients:** this device has no access arbitration.  If
+> another daemon is polling the same hidraw node, its replies are interleaved
+> with ours, and both peers use the same report and command bytes, so a reply
+> cannot be attributed from its header alone.  liquidctl validates the data
+> type and retries the whole endpoint transaction; if the replies still do not
+> match it reports that another program may be using the device.
+
 ## Global Commands
 
 Global commands should work in any mode.

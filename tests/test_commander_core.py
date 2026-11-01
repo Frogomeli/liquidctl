@@ -287,6 +287,48 @@ def test_status_skips_stale_report_commander_st(commander_st_device):
     assert not device._awake
 
 
+def test_status_retries_when_another_client_corrupts_reply(commander_st_device):
+    """A concurrent hidraw client can make the reply carry the wrong data type."""
+    device = commander_st_device.device
+    device.speeds = (2400, 900, 901, 902, 0, 0, 0)
+    device.temperatures = (31.5, None)
+
+    real_read = device.read
+    corrupted = {'done': False}
+
+    def flaky_read(length):
+        res = list(real_read(length))
+        if not corrupted['done'] and device._last_write[2:5] == b'\x08\x00\x01':
+            res[3:5] = [0x00, 0x00]
+            corrupted['done'] = True
+        return res[:length]
+
+    device.read = flaky_read
+
+    res = commander_st_device.get_status()
+
+    assert corrupted['done']
+    assert res[0] == ('Pump speed', 2400, 'rpm')
+    assert res[-1] == ('Water temperature', 31.5, '°C')
+
+
+def test_status_reports_concurrent_client_after_retries(commander_st_device):
+    """Fail with an actionable message if the device keeps returning other data."""
+    device = commander_st_device.device
+    real_read = device.read
+
+    def always_wrong(length):
+        res = list(real_read(length))
+        if device._last_write[2:5] == b'\x08\x00\x01':
+            res[3:5] = [0x00, 0x00]
+        return res[:length]
+
+    device.read = always_wrong
+
+    with pytest.raises(ExpectationNotMet, match='another program may be using the device'):
+        commander_st_device.get_status()
+
+
 def test_send_command_rejects_repeated_stale_reports(commander_core_device):
     """Give up with a driver error if the device never answers the command."""
     device = commander_core_device.device
