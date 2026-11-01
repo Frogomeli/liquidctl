@@ -42,11 +42,12 @@ Device -> Host: 96 bytes for firmware v2.x.x | 1024 bytes for firmware v1.x.x
 | 0x03-... | Data |
 
 > **Note on the Commander ST:** the `1b1c:0c32` HID descriptor advertises
-> 64-byte input and output reports, and captures show 64-byte responses even
-> on firmware 2.x.  A three-packet read therefore carries at most 181 data
-> bytes on the ST (59 + 61 + 61), against 277 on the Core and Core XT.  Do not
-> assume a 96-byte transfer when parsing the ST, and never trust an advertised
-> record count beyond the bytes that were actually received.
+> 64-byte input and output reports, so a single `READ_MORE` packet only carries
+> 61 data bytes.  Large payloads (notably the 211-byte seven-channel fan curve)
+> do not fit in the initial + one MORE + final sequence, and must be read with
+> additional `0x08 0x00 0x02` requests until enough data has been collected.
+> Conversely, write packets must be sized for 64-byte reports (55 data bytes in
+> the first packet, 61 in later ones), not the 96-byte Core/Core XT layout.
 
 > **Note on concurrent clients:** this device has no access arbitration.  If
 > another daemon is polling the same hidraw node, its replies are interleaved

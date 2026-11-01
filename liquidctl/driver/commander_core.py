@@ -19,7 +19,13 @@ from liquidctl.util import clamp, u16le_from
 _LOGGER = logging.getLogger(__name__)
 
 _REPORT_LENGTH = 96
-_RESPONSE_LENGTH = 96
+
+# The Commander ST (1b1c:0c32) advertises 64-byte HID reports.  One MORE packet
+# therefore only carries 61 of the 211 bytes needed for the seven-channel fan
+# curve, so keep reading until the largest payload fits.
+_COMMANDER_ST_PRODUCT_ID = 0x0C32
+_COMMANDER_ST_REPORT_LENGTH = 64
+_COMMANDER_ST_READ_MORE_PACKETS = 3
 
 _INTERFACE_NUMBER = 0
 
@@ -112,7 +118,7 @@ class CommanderCore(UsbHidDriver):
     _MATCHES = [
         (0x1b1c, 0x0c1c, 'Corsair Commander Core (broken)', {"has_pump": True}),
         (0x1b1c, 0x0c2a, 'Corsair Commander Core XT (broken)', {"has_pump": False}),
-        (0x1b1c, 0x0c32, 'Corsair Commander ST (broken)', {"has_pump": True}),
+        (0x1b1c, 0x0c32, 'Corsair Commander ST', {"has_pump": True}),
     ]
 
     def __init__(self, device, description, has_pump, **kwargs):
@@ -221,14 +227,20 @@ class CommanderCore(UsbHidDriver):
 
             # Read in data and split by device
             res = self._read_data(_MODE_HW_CURVE_PERCENT, _DATA_TYPE_HW_CURVE_PERCENT)
-            device_count = res[0]
+            if not res:
+                raise ExpectationNotMet('device returned empty fan curve data')
+            device_count = min(res[0], _MAX_CHANNELS)
             data_by_device = []
 
             i = 1
             for _ in range(0, device_count):
+                if i + 1 >= len(res):
+                    raise ExpectationNotMet('device returned truncated fan curve data')
                 count = res[i+1]
                 start = i
                 end = i + 4 * count + 2
+                if end > len(res):
+                    raise ExpectationNotMet('device returned truncated fan curve data')
                 i = end
                 data_by_device.append(res[start:end])
 
@@ -291,6 +303,17 @@ class CommanderCore(UsbHidDriver):
     def _get_temps(self):
         return _parse_temps(self._read_data(_MODE_GET_TEMPS, _DATA_TYPE_TEMPS))
 
+    def _report_length(self):
+        """HID report size advertised by this device."""
+        if getattr(self.device, 'product_id', None) == _COMMANDER_ST_PRODUCT_ID:
+            return _COMMANDER_ST_REPORT_LENGTH
+        return _REPORT_LENGTH
+
+    def _read_more_packets(self):
+        if self._report_length() == _COMMANDER_ST_REPORT_LENGTH:
+            return _COMMANDER_ST_READ_MORE_PACKETS
+        return 1
+
     def _read_data(self, mode, data_type):
         error = 'device returned no data'
         for attempt in range(_READ_ATTEMPTS):
@@ -299,7 +322,10 @@ class CommanderCore(UsbHidDriver):
 
             self._send_command(_CMD_OPEN_ENDPOINT, mode)
             raw_data = self._send_command(_CMD_READ_INITIAL)
-            more_raw_data = self._send_command(_CMD_READ_MORE)
+            more_raw = [
+                self._send_command(_CMD_READ_MORE)
+                for _ in range(self._read_more_packets())
+            ]
             final_raw_data = self._send_command(_CMD_READ_FINAL)
             self._send_command(_CMD_CLOSE_ENDPOINT)
 
@@ -310,7 +336,11 @@ class CommanderCore(UsbHidDriver):
                 error = 'device returned incorrect data type'
                 continue
 
-            return raw_data[5:] + more_raw_data[3:] + final_raw_data[3:]
+            data = bytearray(raw_data[5:])
+            for packet in more_raw:
+                data.extend(packet[3:])
+            data.extend(final_raw_data[3:])
+            return bytes(data)
 
         raise _DeviceBusy(
             f'{error}; retried {_READ_ATTEMPTS} times (another program may be using the device)'
@@ -318,7 +348,7 @@ class CommanderCore(UsbHidDriver):
 
     def _send_command(self, command, data=()):
         # self.device.write expects buf[0] to be the report number or 0 if not used
-        buf = bytearray(_REPORT_LENGTH + 1)
+        buf = bytearray(self._report_length() + 1)
 
         # buf[1] when going out is always 08
         buf[1] = 0x08
@@ -329,6 +359,8 @@ class CommanderCore(UsbHidDriver):
         data_end = data_start + len(data)
 
         # Fill in the buffer
+        if data_end > len(buf):
+            raise ValueError('command and data exceed the HID report size')
         buf[cmd_start:data_start] = command
         buf[data_start:data_end] = data
 
@@ -341,7 +373,7 @@ class CommanderCore(UsbHidDriver):
         # this command, with a bounded budget so a confused device fails with a
         # clear error instead of spinning forever.
         for _ in range(_MAX_RESPONSE_RETRIES):
-            res = self.device.read(_RESPONSE_LENGTH)
+            res = self.device.read(self._report_length())
             if res and len(res) >= 2 and res[0] == 0x00 and res[1] == command[0]:
                 return bytes(res)
 
@@ -361,12 +393,13 @@ class CommanderCore(UsbHidDriver):
         self._send_command(_CMD_OPEN_ENDPOINT, mode)
 
         # Write data
+        report_length = self._report_length()
         data_len = len(data)
         data_start_index = 0
         while (data_start_index < data_len):
             if (data_start_index == 0):
                 # First 9 bytes are in use
-                packet_data_len = _REPORT_LENGTH - 9
+                packet_data_len = report_length - 9
 
                 if (data_len < packet_data_len):
                     packet_data_len = data_len
@@ -385,7 +418,7 @@ class CommanderCore(UsbHidDriver):
                 data_start_index += packet_data_len
             else:
                 # First 3 bytes are in use
-                packet_data_len = _REPORT_LENGTH - 3
+                packet_data_len = report_length - 3
                 if data_len - data_start_index < packet_data_len:
                     packet_data_len = data_len - data_start_index
 

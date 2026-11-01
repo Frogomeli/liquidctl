@@ -35,6 +35,10 @@ class MockCommanderCoreDevice:
 
         # The Commander ST uses 64-byte HID reports; Core/Core XT use 96.
         self.response_length = 96
+        # Model the ST's small reports as real chunks instead of repeating the
+        # whole payload on every read.
+        self.chunked_reads = False
+        self._read_offset = 0
         # Reports that are delivered ahead of the real command response.
         self.stale_reads = deque()
 
@@ -135,15 +139,28 @@ class MockCommanderCoreDevice:
 
 
 
+        if self.chunked_reads and self._last_write[2] == 0x08:
+            payload = bytes(data[3:])
+            if self._last_write[4] == 0x01:  # initial read starts a transaction
+                capacity = self.response_length - 5
+                self._read_offset = 0
+            else:
+                capacity = self.response_length - 3
+            chunk = payload[self._read_offset:self._read_offset + capacity]
+            self._read_offset += len(chunk)
+            data = bytearray(data[:3]) + chunk
+
         return list(data)[:min(length, self.response_length)]
 
     def write(self, data):
         data = bytes(data)  # ensure data is convertible to bytes
         self._last_write = data
+        self.sent.append(data)
         if data[0] != 0x00 or data[1] != 0x08:
             raise ValueError('Start of packets going out should be 00:08')
         if data[2] == 0x0d:
             channel = data[3]
+            self._read_offset = 0
             if  self._modes.get(channel) is None:
                 self._modes[channel] = data[4:6]
             else:
@@ -211,6 +228,7 @@ def commander_st_device():
     device = MockCommanderCoreDevice()
     device.product_id = 0x0c32
     device.response_length = 64
+    device.chunked_reads = True
     core = CommanderCore(device, 'Corsair Commander ST', True)
     core.connect()
     return core
@@ -285,6 +303,22 @@ def test_status_skips_stale_report_commander_st(commander_st_device):
     assert res[0] == ('Pump speed', 2400, 'rpm')
     assert res[-1] == ('Water temperature', 31.5, '°C')
     assert not device._awake
+
+
+def test_set_speed_profile_commander_st(commander_st_device):
+    """The ST needs several MORE packets for its 211-byte fan curve payload."""
+    device = commander_st_device.device
+    original = [(25 + i, 20 + i * 10) for i in range(7)]
+    device.curve_points_by_device = [list(original) for _ in range(7)]
+
+    commander_st_device.set_speed_profile('fan1', [(30, 40), (50, 80)])
+
+    assert device.curve_points_by_device[1] == [(30, 40), (50, 80)]
+    assert device.curve_points_by_device[0] == original
+    assert device.curve_points_by_device[6] == original
+    # Every outgoing report must fit the ST's 64-byte HID descriptor.
+    assert device.sent
+    assert all(len(packet) <= 65 for packet in device.sent)
 
 
 def test_status_retries_when_another_client_corrupts_reply(commander_st_device):
