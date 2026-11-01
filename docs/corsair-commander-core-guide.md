@@ -92,8 +92,17 @@ The device expects a single frame containing every LED of every channel, so
 liquidctl remembers the colors it has written per channel in its runtime
 storage and merges them into later updates.  Channels that liquidctl has not
 configured yet are written as black, which means the first lighting command
-after a reboot also turns the other channels off.  Animated effects are not
-supported: liquidctl is not a daemon, so it cannot stream frames continuously.
+after a reboot also turns the other channels off.
+
+Waking the device and switching endpoints clears the software lighting frame.
+To keep static colors on, liquidctl replays the last frame it wrote before
+putting the device back to sleep, so later `status`, `initialize` and fan
+commands do not turn the lighting off.  The replayed frame is stored in
+liquidctl's runtime storage and is lost on reboot or when the runtime directory
+is cleared.
+
+Animated effects are not supported: liquidctl is not a daemon, so it cannot
+stream frames continuously.
 
 ## Programming the pump and fan speeds
 

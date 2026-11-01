@@ -335,6 +335,22 @@ def test_set_color_preserves_cached_channels(commander_st_device):
     assert device.color_data[32 * 3:32 * 3 + 3] == b'\x00\x00\x00'
 
 
+def test_status_restores_led_frame(commander_st_device):
+    """A later status read must re-apply the last lighting frame before sleeping."""
+    device = commander_st_device.device
+    device.led_counts = (4, None, None, None, None, None, None)
+    device.speeds = (2400, None, None, None, None, None, None)
+    device.temperatures = (31.0, None)
+
+    commander_st_device.set_color('pump', 'fixed', [(1, 2, 3)])
+    frame = bytes(device.color_data)
+    device.color_data = bytearray()
+
+    commander_st_device.get_status()
+
+    assert bytes(device.color_data) == frame
+
+
 def test_set_color_off_commander_st_pump(commander_st_device):
     device = commander_st_device.device
     device.led_counts = (24, 8, None, None, None, None, None)

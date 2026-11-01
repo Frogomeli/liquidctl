@@ -274,6 +274,7 @@ class CommanderCore(UsbHidDriver):
 
             self._write_color_frame(bytes(payload))
             self._data.store('led_colors', cached)
+            self._data.store('led_frame', bytes(payload).hex())
 
     def _check_color_args(self, channel, mode, colors):
         if mode not in ('off', 'fixed', 'super-fixed'):
@@ -525,7 +526,25 @@ class CommanderCore(UsbHidDriver):
             self._send_command(_CMD_WAKE)
             yield
         finally:
+            self._restore_led_frame()
             self._send_command(_CMD_SLEEP)
+
+    def _restore_led_frame(self):
+        """Re-apply the last lighting frame before the device goes to sleep.
+
+        Waking the device and switching endpoints clears the software lighting
+        frame, so a later `status`/`initialize` would otherwise turn the LEDs
+        off.  Only replay a frame that this driver has written before.
+        """
+        if self._data is None:
+            return
+        frame = self._data.load('led_frame', of_type=str, default=None)
+        if not frame:
+            return
+        try:
+            self._write_color_frame(bytes.fromhex(frame))
+        except Exception as error:
+            _LOGGER.debug('could not restore the LED frame: %s', error)
 
     def _write_data(self, mode, data_type, data):
         self._read_data(mode, data_type)  # Will ensure we are writing the correct data type to avoid breakage
