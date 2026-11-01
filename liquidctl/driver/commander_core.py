@@ -23,6 +23,12 @@ _RESPONSE_LENGTH = 96
 _INTERFACE_NUMBER = 0
 
 _FAN_COUNT = 6
+_MAX_CHANNELS = _FAN_COUNT + 1
+
+# The Commander ST emits unsolicited reports, and a stale reply can be queued
+# between clear_enqueued_reports() and read().  Keep the wait for the actual
+# response bounded so a desynchronized device fails cleanly instead of hanging.
+_MAX_RESPONSE_RETRIES = 8
 
 _CMD_WAKE = (0x01, 0x03, 0x00, 0x02)
 _CMD_SLEEP = (0x01, 0x03, 0x00, 0x01)
@@ -54,6 +60,36 @@ _DATA_TYPE_HW_CURVE_PERCENT = (0x05, 0x00)
 _FAN_MODE_FIXED_PERCENT = 0x00
 _FAN_MODE_CURVE_PERCENT = 0x02
 
+
+def _parse_speeds(data):
+    """Parse a current-speeds payload, ignoring incomplete trailing records."""
+    if not data:
+        return []
+
+    # Each record is an u16le; never trust the advertised count beyond the
+    # number of complete records actually present.
+    count = min(data[0], (len(data) - 1) // 2)
+    speeds_data = data[1:1 + count * 2]
+    return [u16le_from(speeds_data, offset=i * 2) for i in range(count)]
+
+
+def _parse_temps(data):
+    """Parse a temperatures payload, ignoring incomplete trailing records."""
+    if not data:
+        return []
+
+    # Each record is a status byte followed by an u16le in tenths of a degree.
+    count = min(data[0], (len(data) - 1) // 3)
+    temp_data = data[1:1 + count * 3]
+    temps = []
+    for i in range(count):
+        if temp_data[i * 3] == 0x00:
+            temps.append(u16le_from(temp_data, offset=i * 3 + 1) / 10)
+        else:
+            temps.append(None)
+    return temps
+
+
 class CommanderCore(UsbHidDriver):
     """Corsair Commander Core"""
 
@@ -74,13 +110,18 @@ class CommanderCore(UsbHidDriver):
         with self._wake_device_context():
             # Get Firmware
             res = self._send_command(_CMD_GET_FIRMWARE)
+            if len(res) < 6:
+                raise ExpectationNotMet('device returned truncated firmware response')
             fw_version = (res[3], res[4], res[5])
 
             status = [('Firmware version', '{}.{}.{}'.format(*fw_version), '')]
 
-            # Get LEDs per fan
+            # Get LEDs per fan.  The payload can be shorter than the advertised
+            # count on a desynchronized or truncated response (the Commander ST
+            # uses 64-byte HID reports, so its capacity per transaction differs
+            # from the Core/Core XT); only consume complete records.
             res = self._read_data(_MODE_LED_COUNT, _DATA_TYPE_LED_COUNT)
-            num_devices = res[0]
+            num_devices = min(res[0], _MAX_CHANNELS, (len(res) - 1) // 4) if res else 0
             led_data = res[1:1 + num_devices * 4]
             for i in range(0, num_devices):
                 connected = u16le_from(led_data, offset=i * 4) == 2
@@ -94,7 +135,7 @@ class CommanderCore(UsbHidDriver):
 
             # Get what fans are connected
             res = self._read_data(_MODE_CONNECTED_SPEEDS, _DATA_TYPE_CONNECTED_SPEEDS)
-            num_devices = res[0]
+            num_devices = min(res[0], _MAX_CHANNELS, len(res) - 1) if res else 0
             for i in range(0, num_devices):
                 if self._has_pump:
                     label = 'AIO port connected' if i == 0 else f'Fan port {i} connected'
@@ -230,32 +271,10 @@ class CommanderCore(UsbHidDriver):
         yield from super().probe(handle, **kwargs)
 
     def _get_speeds(self):
-        speeds = []
-
-        res = self._read_data(_MODE_GET_SPEEDS, _DATA_TYPE_SPEEDS)
-
-        num_speeds = res[0]
-        speeds_data = res[1:1 + num_speeds * 2]
-        for i in range(0, num_speeds):
-            speeds.append(u16le_from(speeds_data, offset=i * 2))
-
-        return speeds
+        return _parse_speeds(self._read_data(_MODE_GET_SPEEDS, _DATA_TYPE_SPEEDS))
 
     def _get_temps(self):
-        temps = []
-
-        res = self._read_data(_MODE_GET_TEMPS, _DATA_TYPE_TEMPS)
-
-        num_temps = res[0]
-        temp_data = res[1:1 + num_temps * 3]
-        for i in range(0, num_temps):
-            connected = temp_data[i * 3] == 0x00
-            if connected:
-                temps.append(u16le_from(temp_data, offset=i * 3 + 1) / 10)
-            else:
-                temps.append(None)
-
-        return temps
+        return _parse_temps(self._read_data(_MODE_GET_TEMPS, _DATA_TYPE_TEMPS))
 
     def _read_data(self, mode, data_type):
         self._send_command(_CMD_OPEN_ENDPOINT, mode)
@@ -263,6 +282,8 @@ class CommanderCore(UsbHidDriver):
         more_raw_data = self._send_command(_CMD_READ_MORE)
         final_raw_data = self._send_command(_CMD_READ_FINAL)
         self._send_command(_CMD_CLOSE_ENDPOINT)
+        if len(raw_data) < 5:
+            raise ExpectationNotMet('device returned truncated data header')
         if tuple(raw_data[3:5]) != data_type:
             raise ExpectationNotMet('device returned incorrect data type')
 
@@ -287,12 +308,17 @@ class CommanderCore(UsbHidDriver):
         self.device.clear_enqueued_reports()
         self.device.write(buf)
 
-        res = self.device.read(_RESPONSE_LENGTH)
-        while res[0] != 0x00:
+        # A report may arrive between clear_enqueued_reports() and read(): the
+        # Commander ST in particular sends unsolicited reports and can leave a
+        # stale command echo queued.  Skip anything that is not the response to
+        # this command, with a bounded budget so a confused device fails with a
+        # clear error instead of spinning forever.
+        for _ in range(_MAX_RESPONSE_RETRIES):
             res = self.device.read(_RESPONSE_LENGTH)
-        buf = bytes(res)
-        assert buf[1] == command[0], 'response does not match command'
-        return buf
+            if res and len(res) >= 2 and res[0] == 0x00 and res[1] == command[0]:
+                return bytes(res)
+
+        raise ExpectationNotMet('response does not match command')
 
     @contextmanager
     def _wake_device_context(self):

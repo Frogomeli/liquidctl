@@ -2,7 +2,7 @@ import pytest
 from collections import deque
 
 from liquidctl import ExpectationNotMet
-from liquidctl.driver.commander_core import CommanderCore
+from liquidctl.driver.commander_core import CommanderCore, _parse_speeds, _parse_temps
 from _testutils import noop
 from liquidctl.util import u16le_from
 
@@ -33,6 +33,11 @@ class MockCommanderCoreDevice:
         self._modes = {}
         self._awake = False
 
+        # The Commander ST uses 64-byte HID reports; Core/Core XT use 96.
+        self.response_length = 96
+        # Reports that are delivered ahead of the real command response.
+        self.stale_reads = deque()
+
         self.response_prefix = ()
         self.firmware_version = (0x00, 0x00, 0x00)
         self.led_counts = (None, None, None, None, None, None, None)
@@ -43,6 +48,9 @@ class MockCommanderCoreDevice:
         self.curve_points_by_device = [[],[],[],[],[],[],[]]
 
     def read(self, length):
+        if self.stale_reads:
+            return list(self.stale_reads.popleft())[:length]
+
         data = bytearray([0x00, self._last_write[2], 0x00])
         data.extend(self.response_prefix)
 
@@ -127,7 +135,7 @@ class MockCommanderCoreDevice:
 
 
 
-        return list(data)[:length]
+        return list(data)[:min(length, self.response_length)]
 
     def write(self, data):
         data = bytes(data)  # ensure data is convertible to bytes
@@ -196,6 +204,119 @@ def commander_core_device():
     core = CommanderCore(device, 'Corsair Commander Core', True)
     core.connect()
     return core
+
+
+@pytest.fixture
+def commander_st_device():
+    device = MockCommanderCoreDevice()
+    device.product_id = 0x0c32
+    device.response_length = 64
+    core = CommanderCore(device, 'Corsair Commander ST', True)
+    core.connect()
+    return core
+
+
+def test_initialize_commander_st_64_byte_reports(commander_st_device):
+    """Initialization must work with the Commander ST's 64-byte HID reports."""
+    device = commander_st_device.device
+    device.firmware_version = (0x02, 0x00, 0x13)
+    device.led_counts = (29, 8, 8, None, None, None, None)
+    device.speeds = (2553, 1074, 1051, 1054, None, None, None)
+    device.temperatures = (34.8, None)
+
+    res = commander_st_device.initialize()
+
+    assert len(res) == 17
+    assert res[0][1] == '2.0.19'
+
+    # LED counts for pump head and the three connected fan ports
+    assert res[1][1] == 29
+    assert res[2][1] == 8
+    assert res[3][1] == 8
+    assert res[4][1] is None
+
+    # Connected speed devices
+    assert res[8][1] is True   # AIO/EXT port
+    assert res[9][1] is True   # fan 1
+    assert res[10][1] is True  # fan 2
+    assert res[11][1] is True  # fan 3
+    assert res[12][1] is False  # fan 4
+
+    # Coolant sensor present, probe absent
+    assert res[15][1] is True
+    assert res[16][1] is False
+
+    assert not device._awake
+
+
+def test_status_commander_st_64_byte_reports(commander_st_device):
+    """Status must return coolant temperature, pump RPM and fan RPM on the ST."""
+    device = commander_st_device.device
+    device.speeds = (2553, 1074, 1051, 1054, 0, 0, 0)
+    device.temperatures = (34.8, None)
+
+    res = commander_st_device.get_status()
+
+    assert res == [
+        ('Pump speed', 2553, 'rpm'),
+        ('Fan speed 1', 1074, 'rpm'),
+        ('Fan speed 2', 1051, 'rpm'),
+        ('Fan speed 3', 1054, 'rpm'),
+        ('Fan speed 4', 0, 'rpm'),
+        ('Fan speed 5', 0, 'rpm'),
+        ('Fan speed 6', 0, 'rpm'),
+        ('Water temperature', 34.8, '°C'),
+    ]
+
+    assert not device._awake
+
+
+def test_status_skips_stale_report_commander_st(commander_st_device):
+    """An unsolicited/stale report must not be mistaken for the command reply."""
+    device = commander_st_device.device
+    device.speeds = (2400, 900, 901, 902, 0, 0, 0)
+    device.temperatures = (31.5, None)
+    # This is what the ST can leave queued between clear_enqueued_reports()
+    # and the first read of a new transaction.
+    device.stale_reads.append([0x00, 0x05, 0x00] + [0x00] * 61)
+
+    res = commander_st_device.get_status()
+
+    assert res[0] == ('Pump speed', 2400, 'rpm')
+    assert res[-1] == ('Water temperature', 31.5, '°C')
+    assert not device._awake
+
+
+def test_send_command_rejects_repeated_stale_reports(commander_core_device):
+    """Give up with a driver error if the device never answers the command."""
+    device = commander_core_device.device
+    for _ in range(8):
+        device.stale_reads.append([0x00, 0x05, 0x00] + [0x00] * 61)
+
+    with pytest.raises(ExpectationNotMet):
+        commander_core_device._send_command((0x01, 0x03, 0x00, 0x02))
+
+
+def test_parse_speeds_ignores_incomplete_record():
+    # Advertised count 3, but only two complete u16le records are present.
+    data = bytes([0x03, 0x84, 0x09, 0xE9, 0x01, 0x0D])
+    assert _parse_speeds(data) == [2436, 489]
+
+
+def test_parse_temps_ignores_incomplete_record():
+    # count=3; two complete records, the third is cut short.
+    data = bytes([0x03, 0x00, 0x30, 0x01, 0x00, 0x35, 0x01])
+    assert _parse_temps(data) == [30.4, 30.9]
+
+
+def test_parse_temps_reports_disconnected_sensor():
+    data = bytes([0x02, 0x01, 0x00, 0x00, 0x00, 0x30, 0x01])
+    assert _parse_temps(data) == [None, 30.4]
+
+
+def test_parse_empty_payloads():
+    assert _parse_speeds(bytes()) == []
+    assert _parse_temps(bytes()) == []
 
 
 def test_initialize_commander_core(commander_core_device):

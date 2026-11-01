@@ -41,6 +41,13 @@ Device -> Host: 96 bytes for firmware v2.x.x | 1024 bytes for firmware v1.x.x
 | 0x02 | 0x00 |
 | 0x03-... | Data |
 
+> **Note on the Commander ST:** the `1b1c:0c32` HID descriptor advertises
+> 64-byte input and output reports, and captures show 64-byte responses even
+> on firmware 2.x.  A three-packet read therefore carries at most 181 data
+> bytes on the ST (59 + 61 + 61), against 277 on the Core and Core XT.  Do not
+> assume a 96-byte transfer when parsing the ST, and never trust an advertised
+> record count beyond the bytes that were actually received.
+
 ## Global Commands
 
 Global commands should work in any mode.
